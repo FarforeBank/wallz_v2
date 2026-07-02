@@ -39,38 +39,6 @@ class AlphaZeroPredictor:
         print(f"[AlphaZero] Loaded: {checkpoint}")
         print(f"[AlphaZero] MCTS simulations: {self.mcts_simulations}")
 
-    def state_key(self, env):
-        return (
-            env.p1_pos,
-            env.p2_pos,
-            env.current_player,
-            env.walls_left[1],
-            env.walls_left[2],
-            env.h_walls.tobytes(),
-            env.v_walls.tobytes(),
-        )
-
-    def action_repeats_state(self, env, action):
-        sim_env = copy.deepcopy(env)
-        sim_env.step(int(action))
-        return self.state_key(sim_env) in self.state_history
-
-    def state_key(self, env):
-        return (
-            env.p1_pos,
-            env.p2_pos,
-            env.current_player,
-            env.walls_left[1],
-            env.walls_left[2],
-            env.h_walls.tobytes(),
-            env.v_walls.tobytes(),
-        )
-
-    def action_repeats_state(self, env, action):
-        sim_env = copy.deepcopy(env)
-        sim_env.step(int(action))
-        return self.state_key(sim_env) in self.state_history
-
     def action_repeats_own_position(self, env, action):
         sim_env = copy.deepcopy(env)
         sim_env.step(int(action))
@@ -82,37 +50,7 @@ class AlphaZeroPredictor:
 
         return False
 
-    def escape_action(self, env, mask):
-        legal_actions = [int(a) for a in np.flatnonzero(mask)]
-        candidates = []
 
-        for action in legal_actions:
-            if self.action_repeats_state(env, action):
-                continue
-            if self.action_repeats_own_position(env, action):
-                continue
-
-            sim_env = copy.deepcopy(env)
-            sim_env.step(action)
-
-            try:
-                dist = sim_env._get_bfs_distance(sim_env.p1_pos, 0)
-            except Exception:
-                dist = 99
-
-            # Prefer pawn moves over walls in browser escape.
-            wall_penalty = 5 if action >= 81 else 0
-
-            # Prefer less revisited own squares.
-            revisit_penalty = list(self.p1_position_history).count(sim_env.p1_pos) * 10
-
-            candidates.append((dist + wall_penalty + revisit_penalty, action))
-
-        if not candidates:
-            return None
-
-        candidates.sort()
-        return candidates[0][1]
 
     def raw_predict(self, obs, action_masks=None):
         with torch.no_grad():
@@ -162,10 +100,6 @@ class AlphaZeroPredictor:
                     print(f"[AlphaZeroMCTS] action={action} prob={probs[action]:.3f}")
                     return action
 
-                escape = self.escape_action(env, mask)
-                if escape is not None:
-                    print(f"[AlphaZeroEscape] action={escape}")
-                    return escape
 
                 if best_repeat is not None:
                     print(f"[AlphaZeroMCTS] no escape, least-bad repeat action={best_repeat} prob={probs[best_repeat]:.3f}")
@@ -239,7 +173,8 @@ def main():
     agent.model_path = checkpoint
 
     def predict_action_with_mcts(self, masks):
-        return predictor.predict_from_env(self.env, self.obs, masks)
+        full_legal_mask = self.env.get_legal_action_mask()
+        return predictor.predict_from_env(self.env, self.obs, full_legal_mask)
 
     agent.predict_action = types.MethodType(predict_action_with_mcts, agent)
 

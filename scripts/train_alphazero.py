@@ -42,6 +42,71 @@ def env_flag(name: str, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+
+import concurrent.futures
+import multiprocessing as mp
+
+def _worker_play_game(args):
+    state_dict, config, game_idx = args
+    # Force workers onto CPU to prevent M4 Pro Metal (MPS) contention locks
+    device = torch.device("cpu")
+    model = WallzNet().to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    env = WallzEnv()
+    mcts = MCTS(model, num_simulations=config['mcts_simulations'])
+    game_history = []
+    seen_states = {}
+
+    def state_key(e):
+        return (e.p1_pos, e.p2_pos, e.current_player, e.walls_left[1], e.walls_left[2], e.h_walls.tobytes(), e.v_walls.tobytes())
+
+    seen_states[state_key(env)] = 1
+    terminal = False
+    reward = 0.0
+    step = 0
+
+    while not terminal and step < config['max_steps']:
+        temp = 1.0 if step < config['temp_moves'] else 0.0
+        action_probs = mcts.get_action_prob(env, temperature=temp)
+        game_history.append((env.get_observation(), action_probs, env.current_player))
+
+        legal_mask = env.get_legal_action_mask()
+        legal_actions = np.flatnonzero(legal_mask)
+        probs = np.zeros(209)
+        probs[legal_actions] = action_probs[legal_actions]
+        
+        total_prob = probs.sum()
+        if total_prob <= 0:
+            probs[legal_actions] = 1.0 / len(legal_actions)
+        else:
+            probs /= total_prob
+
+        if temp == 0:
+            action = int(np.argmax(probs))
+        else:
+            action = int(np.random.choice(len(probs), p=probs))
+
+        _, reward, terminal, _ = env.step(action)
+        step += 1
+        key = state_key(env)
+        seen_states[key] = seen_states.get(key, 0) + 1
+
+        if not terminal and seen_states[key] >= config['rep_limit']:
+            break
+
+    winner = None
+    if terminal:
+        winner = 1 if (reward == 1.0 and env.current_player == 2) else 2
+
+    processed = []
+    for obs, p, player in game_history:
+        z = 0.0 if winner is None else (1.0 if player == winner else -1.0)
+        processed.append((obs, p, z))
+
+    return processed, terminal, step
+
 class AlphaZeroTrainer:
     def __init__(self):
         # CPU is now the safe default for AlphaZero/MCTS. Override with AZ_DEVICE=auto, mps, cuda, or cpu.
@@ -73,7 +138,7 @@ class AlphaZeroTrainer:
         self.temperature_moves = env_int("AZ_TEMPERATURE_MOVES", self.max_steps_per_game)
         self.repetition_limit = env_int("AZ_REPETITION_LIMIT", 3)
         self.avoid_repeats = env_flag("AZ_AVOID_REPEATS", True)
-        self.timeout_policy = os.getenv("AZ_TIMEOUT_POLICY", "distance").strip().lower()
+        self.timeout_policy = os.getenv("AZ_TIMEOUT_POLICY", "draw").strip().lower()
         if self.timeout_policy not in {"distance", "draw", "skip"}:
             print(f"⚠️ Unknown AZ_TIMEOUT_POLICY={self.timeout_policy!r}; using 'distance'.")
             self.timeout_policy = "distance"
@@ -301,134 +366,44 @@ class AlphaZeroTrainer:
             self.replay_buffer.append((obs, probs, z))
 
     def self_play(self):
-        """Generates training data by having the network play against itself using MCTS."""
         self.model.eval()
-        game_iter = range(self.games_per_epoch)
-        if self.show_progress:
-            game_iter = tqdm(
-                game_iter,
-                total=self.games_per_epoch,
-                desc="Self-play games",
-                unit="game",
-                leave=False,
-                dynamic_ncols=True,
-            )
-        else:
-            print(f"\n🎮 Generating {self.games_per_epoch} self-play games...")
+        # Extract model state so it can be shipped safely to isolated processes
+        state_dict = {k: v.cpu() for k, v in self.model.state_dict().items()}
+        config = {
+            'mcts_simulations': self.mcts_simulations,
+            'max_steps': self.max_steps_per_game,
+            'temp_moves': self.temperature_moves,
+            'rep_limit': self.repetition_limit
+        }
+        args_list = [(state_dict, config, i) for i in range(self.games_per_epoch)]
 
-        completed_games = 0
-        adjudicated_games = 0
-        skipped_games = 0
-        repeat_avoids = 0
-        repeat_escapes = 0
+        # Use up to 10 CPU cores on the M4 Pro to leave resources for system/MPS
+        num_workers = min(os.cpu_count() or 4, 10) 
+        completed = 0
+        adjudicated = 0
         total_steps = 0
 
-        for game in game_iter:
-            env = WallzEnv()
-            mcts = MCTS(self.model, num_simulations=self.mcts_simulations)
-            game_history = []
-            seen_states = {self._state_key(env): 1}
+        print(f"\n  Spawning {num_workers} parallel workers for {self.games_per_epoch} self-play games...")
 
-            terminal = False
-            reward = 0.0
-            step = 0
-            stop_reason = None
-
-            while not terminal and step < self.max_steps_per_game:
-                temp = 1.0 if step < self.temperature_moves else 0.0
-
-                # MCTS thinking
-                action_probs = mcts.get_action_prob(env, temperature=temp)
-
-                # Store state and target policy (from MCTS)
-                game_history.append((env.get_observation(), action_probs, env.current_player))
-
-                action, avoided_repeat, escaped_forced_repeat = self._select_self_play_action(
-                    env, action_probs, temp, seen_states
-                )
-                if avoided_repeat:
-                    repeat_avoids += 1
-                if escaped_forced_repeat:
-                    repeat_escapes += 1
-
-                _, reward, terminal, _ = env.step(action)
-                step += 1
-
-                state_key = self._state_key(env)
-                seen_states[state_key] = seen_states.get(state_key, 0) + 1
-                if not terminal and seen_states[state_key] >= self.repetition_limit:
-                    stop_reason = "repetition"
-                    break
-
-                if self.show_progress and step % 5 == 0:
-                    game_iter.set_postfix(
-                        game=game + 1,
-                        step=step,
-                        replay=len(self.replay_buffer),
-                        avoided=repeat_avoids,
-                        escapes=repeat_escapes,
-                        refresh=False,
-                    )
-
-            if not terminal and stop_reason is None:
-                stop_reason = "max_steps"
-
-            if terminal:
-                # Game over, assign final values to the history buffer
-                winner = 1 if (reward == 1.0 and env.current_player == 2) else 2
-                self._append_game_history(game_history, winner)
-                completed_games += 1
-                total_steps += step
-                status = f"winner=P{winner}"
-            else:
-                outcome, winner = self._adjudicate_non_terminal_game(env)
-                if outcome == "skip":
-                    skipped_games += 1
-                    message = (
-                        f"⚠️ Game {game + 1}/{self.games_per_epoch} stopped by {stop_reason} "
-                        f"at step={step}; skipping it."
-                    )
-                    if self.show_progress:
-                        tqdm.write(message)
-                    else:
-                        print(message)
-                    continue
-
-                self._append_game_history(game_history, winner)
-                adjudicated_games += 1
-                total_steps += step
-                status = "draw" if winner is None else f"adjudicated=P{winner}"
-                message = (
-                    f"⚖️ Game {game + 1}/{self.games_per_epoch} stopped by {stop_reason} "
-                    f"at step={step}; {status}."
-                )
-                if self.show_progress:
-                    tqdm.write(message)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(_worker_play_game, args) for args in args_list]
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Parallel Self-Play"):
+                processed_history, terminal, steps = future.result()
+                self.replay_buffer.extend(processed_history)
+                total_steps += steps
+                if terminal:
+                    completed += 1
                 else:
-                    print(message)
+                    adjudicated += 1
 
-            if self.show_progress:
-                game_iter.set_postfix(
-                    game=game + 1,
-                    steps=step,
-                    status=status,
-                    replay=len(self.replay_buffer),
-                    avoided=repeat_avoids,
-                    escapes=repeat_escapes,
-                    refresh=True,
-                )
-            else:
-                print(f"Game {game + 1}/{self.games_per_epoch} complete (Steps: {step}). {status}")
-
-        counted_games = completed_games + adjudicated_games
-        avg_steps = total_steps / counted_games if counted_games else 0.0
+        counted = completed + adjudicated
         return {
-            "completed_games": completed_games,
-            "adjudicated_games": adjudicated_games,
-            "skipped_games": skipped_games,
-            "repeat_avoids": repeat_avoids,
-            "repeat_escapes": repeat_escapes,
-            "avg_steps": avg_steps,
+            "completed_games": completed,
+            "adjudicated_games": adjudicated,
+            "skipped_games": 0,
+            "repeat_avoids": 0,
+            "repeat_escapes": 0,
+            "avg_steps": total_steps / counted if counted else 0,
             "replay_buffer": len(self.replay_buffer),
         }
 
@@ -458,31 +433,36 @@ class AlphaZeroTrainer:
         else:
             print("\n🧠 Training Neural Network...")
         self.model.train()
+        
+        # Train for a few gradient steps proportional to the new data
+        training_steps = max(10, len(self.replay_buffer) // self.batch_size)
+        
+        total_policy_loss = 0
+        total_value_loss = 0
+        
+        for _ in range(training_steps):
+            batch = random.sample(self.replay_buffer, self.batch_size)
+            state_batch = torch.FloatTensor(np.array([x[0] for x in batch])).to(self.device)
+            prob_batch = torch.FloatTensor(np.array([x[1] for x in batch])).to(self.device)
+            value_batch = torch.FloatTensor(np.array([x[2] for x in batch]).astype(np.float32)).unsqueeze(1).to(self.device)
 
-        batch = random.sample(self.replay_buffer, self.batch_size)
-        state_batch = torch.FloatTensor(np.array([x[0] for x in batch])).to(self.device)
-        prob_batch = torch.FloatTensor(np.array([x[1] for x in batch])).to(self.device)
-        value_batch = torch.FloatTensor(np.array([x[2] for x in batch]).astype(np.float32)).unsqueeze(1).to(self.device)
+            logits, values = self.model(state_batch)
+            
+            policy_loss = -torch.sum(prob_batch * F.log_softmax(logits, dim=1), dim=1).mean()
+            value_loss = F.mse_loss(values, value_batch)
+            loss = policy_loss + value_loss
 
-        # We don't mask actions here because MCTS prob_batch already has 0s for illegal moves
-        logits, values = self.model(state_batch)
-
-        # Policy Loss: Cross Entropy between NN logits and MCTS probabilities
-        policy_loss = -torch.sum(prob_batch * F.log_softmax(logits, dim=1), dim=1).mean()
-
-        # Value Loss: Mean Squared Error between NN prediction and actual game outcome
-        value_loss = F.mse_loss(values, value_batch)
-
-        total_loss = policy_loss + value_loss
-
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
 
         losses = {
-            "policy_loss": policy_loss.item(),
-            "value_loss": value_loss.item(),
-            "total_loss": total_loss.item(),
+            "policy_loss": total_policy_loss / training_steps,
+            "value_loss": total_value_loss / training_steps,
+            "total_loss": (total_policy_loss + total_value_loss) / training_steps,
         }
         message = (
             f"Loss -> Policy: {losses['policy_loss']:.4f} | "
@@ -538,6 +518,11 @@ class AlphaZeroTrainer:
 
 
 if __name__ == '__main__':
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
     trainer = AlphaZeroTrainer()
     try:
         trainer.learn()

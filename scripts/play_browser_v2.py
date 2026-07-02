@@ -391,100 +391,33 @@ class BrowserAgentV2:
         fast = bool(force_fast or force_move_only)
 
         def move_score(action):
-            target = options[action].get("target_pos", p1_pos)
-            dist = self.env._get_bfs_distance(target, 0)
-            center_bias = abs(target[0] - 4) * 0.05
-            return dist + center_bias
+            guard = f" guard {action_name(predicted)}->{action_name(action)}" if overridden and predicted >= 0 else ""
 
-        # No ProgressGuard. Trust the model if its action is legal and clickable.
-        if predicted in options and not fast:
-            return predicted, False
-
-        # Timer / invalid-action fallback: fastest pawn move.
-        if move_actions:
-            return min(move_actions, key=move_score), predicted not in options
-
-        if options:
-            return next(iter(options)), predicted not in options
-
-        return None, False
-
-    def predict_action(self, masks):
-        if self.model is None:
-            return -1
-        predicted, _ = self.model.predict(self.obs, action_masks=masks, deterministic=True)
-        return int(predicted)
-
-    def reset_identity(self):
-        self.own_color = None
-        self.last_own_xy = None
-        self.last_centers = None
-        self.position_history.clear()
-        self.env.walls_left[1] = 10
-        self.walls_left = 10
-
-    def play_loop(self, page):
-        while True:
-            try:
-                turn_started = time.monotonic()
-
-                state = self.read_board(page)
-                if state is None:
-                    print("[Wait] board not found")
-                    time.sleep(0.7)
-                    continue
-
-                centers = self.cell_centers(state)
-                if len(centers[0]) < 9 or len(centers[1]) < 9:
-                    print("[Wait] grid not detected")
-                    time.sleep(0.7)
-                    continue
-
-                own, opponent = self.pick_pawns(state)
-                if own is None:
-                    print("[Wait] pawns not detected")
-                    time.sleep(0.7)
-                    continue
-
-                p1_pos, p2_pos = self.sync_env(page, own, opponent, state, centers)
-
-                if p1_pos[1] == 0 or p2_pos[1] == 8:
-                    print(f"[Wait] match ended P1={p1_pos} P2={p2_pos}")
-                    self.reset_identity()
-                    time.sleep(1.7)
-                    continue
-
-                options = self.move_options(own, state, centers)
-                if not options:
-                    print(f"[Wait] not our turn P1={p1_pos} P2={p2_pos} walls={self.walls_left}")
-                    time.sleep(0.7)
-                    continue
-
-                masks = np.zeros(TOTAL_ACTIONS, dtype=bool)
-                for action in options:
-                    masks[action] = True
-
-                elapsed = time.monotonic() - turn_started
-                timer_seconds = self.read_timer_seconds(page)
-                force_fast = elapsed >= self.max_turn_seconds
-
-                if timer_seconds is not None and timer_seconds <= 5:
-                    force_fast = True
-                    print(f"[Timer] low visible timer={timer_seconds}s; forcing fast move")
-
-                predicted = self.predict_action(masks)
-                action, overridden = self.choose_action(predicted, options, p1_pos, force_fast=force_fast)
-
-                if action is None:
-                    time.sleep(0.5)
-                    continue
+            if action < 81:
 
                 target = options[action]
+
                 target_pos = target["target_pos"]
-                guard = f" guard {action_name(predicted)}->{action_name(action)}" if overridden and predicted >= 0 else ""
 
                 print(f"[Move] P1={p1_pos} P2={p2_pos} {action_name(action)}->{target_pos}{guard}")
+
                 page.mouse.click(target["x"], target["y"])
+
+            else:
+
+                from wallz_v2.env.action_space import action_to_move
+
+                move_type, (r, c) = action_to_move(action)
+
+                xs, ys = centers
+
+                click_x = (xs[c] + xs[c + 1]) / 2.0
+
+                click_y = (ys[r] + ys[r + 1]) / 2.0
+
+                print(f"[{move_type}] P1={p1_pos} P2={p2_pos} r={r} c={c}{guard}")
+
+                page.mouse.click(click_x, click_y)
 
                 self.position_history.append(target_pos)
                 self.position_history = self.position_history[-12:]
