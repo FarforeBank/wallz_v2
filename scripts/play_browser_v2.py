@@ -386,43 +386,26 @@ class BrowserAgentV2:
 
         return options
 
-    def choose_action(self, predicted, options, p1_pos, force_fast=False):
+    def choose_action(self, predicted, options, p1_pos, force_fast=False, force_move_only=False):
         move_actions = [a for a in options if a < NUM_SQUARES]
-
-        def is_backward(action):
-            if action not in move_actions:
-                return False
-            target = options[action].get("target_pos", p1_pos)
-            return target[1] > p1_pos[1]
+        fast = bool(force_fast or force_move_only)
 
         def move_score(action):
             target = options[action].get("target_pos", p1_pos)
             dist = self.env._get_bfs_distance(target, 0)
-            backward_penalty = 8.0 if (not self.allow_backward and is_backward(action)) else 0.0
             center_bias = abs(target[0] - 4) * 0.05
-            return dist + backward_penalty + center_bias
+            return dist + center_bias
 
-        usable_moves = move_actions
-        if not self.allow_backward:
-            non_backward = [a for a in move_actions if not is_backward(a)]
-            if non_backward:
-                usable_moves = non_backward
+        # No ProgressGuard. Trust the model if its action is legal and clickable.
+        if predicted in options and not fast:
+            return predicted, False
 
-        # Do not use the old CycleGuard.
-        # Execute the model move if it is currently clickable and not blocked by the optional backward guard.
-        if predicted in options and not force_fast:
-            if self.allow_backward or not is_backward(predicted) or not usable_moves:
-                return predicted, False
-            fallback = min(usable_moves, key=move_score)
-            print(f"[ProgressGuard] blocked backward {action_name(predicted)}->{action_name(fallback)}")
-            return fallback, True
-
-        # Fallback only when model action is not clickable or timer guard forces fast move.
-        if usable_moves:
-            return min(usable_moves, key=move_score), predicted not in options
-
+        # Timer / invalid-action fallback: fastest pawn move.
         if move_actions:
             return min(move_actions, key=move_score), predicted not in options
+
+        if options:
+            return next(iter(options)), predicted not in options
 
         return None, False
 
@@ -531,9 +514,7 @@ def main():
         max_turn_seconds=args.max_turn_seconds,
         allow_backward=args.allow_backward,
     )
-    print("[System] Browser agent mode: move-only stable, no CycleGuard")
-    if not args.allow_backward:
-        print("[System] ProgressGuard: backward moves blocked when alternatives exist")
+    print("[System] Browser agent mode: no ProgressGuard")
     print(f"[System] Browser profile: {PROFILE_DIR}")
     agent.run(args.url)
 
