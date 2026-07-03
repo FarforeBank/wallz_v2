@@ -1,4 +1,5 @@
 import sys
+import re
 import asyncio
 import numpy as np
 import torch
@@ -36,11 +37,45 @@ class WallzAssistant:
         seen_states[state_key(env)] = 1
         
         try:
-            # 1. Собираем все ходы
-            move_elements = await page.locator('ol > li span[style*="color: var(--color-ink)"]').all_inner_texts()
+            # Safely grab all raw text from the history list, ignoring CSS/HTML tags
+            elements = await page.locator('ol > li').all_inner_texts()
+            history_text = " ".join(elements).lower()
             
-            if not move_elements:
+            if not history_text:
                 return env, seen_states
+
+            # Regex to find all valid Quoridor moves: e.g., 'e2', 'e8v', 'c5h'
+            moves = re.findall(r'([a-i])([1-9])([hv]?)', history_text)
+            
+            col_map = {'a': 0, 'b': 1, 'c': 2, 'd': 3, 'e': 4, 'f': 5, 'g': 6, 'h': 7, 'i': 8}
+            row_map = {'9': 0, '8': 1, '7': 2, '6': 3, '5': 4, '4': 5, '3': 6, '2': 7, '1': 8}
+
+            for m in moves:
+                c_char, r_char, w_char = m
+                col_idx = col_map[c_char]
+                row_idx = row_map[r_char]
+                
+                if not w_char:
+                    action = move_to_action('MOVE', row_idx, col_idx)
+                else:
+                    # Direct coordinate mapping (Reverted the math bug)
+                    wall_r = row_idx
+                    wall_c = col_idx
+                    if wall_r < 0 or wall_r > 7 or wall_c < 0 or wall_c > 7:
+                        continue
+                    if w_char == 'h':
+                        action = move_to_action('WALL_H', wall_r, wall_c)
+                    elif w_char == 'v':
+                        action = move_to_action('WALL_V', wall_r, wall_c)
+                        
+                env.step(action)
+                key = state_key(env)
+                seen_states[key] = seen_states.get(key, 0) + 1
+                
+        except Exception as e:
+            print(f"❌ Error parsing board history: {e}")
+            
+        return env, seen_states
 
             # 2. Маппинг координат Wallz.gg (i->a, 9->1)
             col_map = {'a': 0, 'b': 1, 'c': 2, 'd': 3, 'e': 4, 'f': 5, 'g': 6, 'h': 7, 'i': 8}
@@ -138,8 +173,8 @@ class WallzAssistant:
                     is_my_turn = await page.locator("text='Your turn'").is_visible()
                     
                     if is_my_turn:
-                        move_elements = await page.locator('ol > li span[style*="color: var(--color-ink)"]').all_inner_texts()
-                        current_moves = len(move_elements)
+                        history_text = " ".join(await page.locator('ol > li').all_inner_texts()).lower()
+                        current_moves = len(re.findall(r'\b[a-i][1-9][hv]?\b', history_text))
                         
                         if current_moves != last_processed_moves:
                             await page.evaluate("document.getElementById('az-status').innerText = '⏳ Thinking...'")
