@@ -81,7 +81,7 @@ def _worker_play_game(args):
         for act in legal_actions:
             sim_env = copy.deepcopy(env)
             sim_env.step(int(act))
-            if seen_states.get(state_key(sim_env), 0) >= 1:
+            if seen_states.get(state_key(sim_env), 0) >= config['rep_limit'] - 1:
                 probs[act] = 0.0
                 
         total_prob = probs.sum()
