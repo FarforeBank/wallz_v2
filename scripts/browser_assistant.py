@@ -24,7 +24,7 @@ class WallzAssistant:
         self.model = WallzNet(num_channels=8) 
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
-        self.mcts = MCTS(self.model, num_simulations=400) 
+        self.mcts = MCTS(self.model, num_simulations=200) 
 
     async def extract_board_state(self, page):
         env = WallzEnv()
